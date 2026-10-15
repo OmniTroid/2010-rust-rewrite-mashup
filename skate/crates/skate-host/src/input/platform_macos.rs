@@ -4,12 +4,17 @@
 //! the scale differs: gilrs hands out -1..1 floats, mapped back onto i16 here.
 //!
 //! A gilrs instance is owned by one thread that pumps its events and publishes
-//! a snapshot per slot; `poll` only reads the snapshots.
+//! a snapshot per slot; `poll` only reads the snapshots. The Switch 2 Pro
+//! Controller sends nothing until it is initialised over USB, so gilrs skips it
+//! and [`switch2`] publishes it instead.
 use super::{CapabilityCache, DeviceError, DevicePacket};
 use gilrs::{Axis, Button, GamepadId, GilrsBuilder};
 use skate_core::input::xbox::XboxState;
 use std::sync::{Mutex, Once};
 use std::time::Duration;
+
+#[path = "switch2_macos.rs"]
+mod switch2;
 
 /// `XINPUT_DEVSUBTYPE_GAMEPAD`.
 const SUBTYPE_GAMEPAD: u8 = 1;
@@ -41,9 +46,15 @@ struct State {
     right: [i16; 2],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Gilrs(GamepadId),
+    Switch2,
+}
+
 #[derive(Clone, Copy)]
 struct Slot {
-    id: GamepadId,
+    source: Source,
     number: u32,
     state: State,
 }
@@ -85,6 +96,23 @@ fn read(pad: &gilrs::Gamepad<'_>) -> State {
     }
 }
 
+/// Updates `source`'s slot, or claims a free one and calls `connected`.
+fn publish(slots: &mut [Option<Slot>; 4], source: Source, state: State, connected: impl FnOnce()) {
+    if let Some(slot) = slots.iter_mut().flatten().find(|s| s.source == source) {
+        if slot.state != state {
+            slot.number = slot.number.wrapping_add(1);
+            slot.state = state;
+        }
+    } else if let Some(free) = slots.iter_mut().find(|s| s.is_none()) {
+        connected();
+        *free = Some(Slot {
+            source,
+            number: 1,
+            state,
+        });
+    }
+}
+
 fn pump() {
     let mut gilrs = match GilrsBuilder::new().with_default_filters(false).build() {
         Ok(gilrs) => gilrs,
@@ -102,18 +130,17 @@ fn pump() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for slot in slots.iter_mut() {
-            if slot.is_some_and(|s| gilrs.connected_gamepad(s.id).is_none()) {
+            if slot.is_some_and(
+                |s| matches!(s.source, Source::Gilrs(id) if gilrs.connected_gamepad(id).is_none()),
+            ) {
                 *slot = None;
             }
         }
         for (id, pad) in gilrs.gamepads() {
-            let state = read(&pad);
-            if let Some(slot) = slots.iter_mut().flatten().find(|s| s.id == id) {
-                if slot.state != state {
-                    slot.number = slot.number.wrapping_add(1);
-                    slot.state = state;
-                }
-            } else if let Some(free) = slots.iter_mut().find(|s| s.is_none()) {
+            if switch2::is_switch2(pad.vendor_id(), pad.product_id()) {
+                continue;
+            }
+            publish(&mut slots, Source::Gilrs(id), read(&pad), || {
                 bevy::log::info!(
                     "skate: gamepad '{}' ({:04x}:{:04x}, {:?} mapping)",
                     pad.name(),
@@ -121,12 +148,7 @@ fn pump() {
                     pad.product_id().unwrap_or(0),
                     pad.mapping_source()
                 );
-                *free = Some(Slot {
-                    id,
-                    number: 1,
-                    state,
-                });
-            }
+            });
         }
     }
 }
@@ -137,6 +159,10 @@ pub(super) fn poll(index: usize, cache: &mut CapabilityCache) -> Result<DevicePa
             .name("skate-gamepad".into())
             .spawn(pump)
             .expect("spawn the gamepad thread");
+        std::thread::Builder::new()
+            .name("skate-switch2".into())
+            .spawn(switch2::run)
+            .expect("spawn the Switch 2 thread");
     });
     let slots = SLOTS
         .lock()
